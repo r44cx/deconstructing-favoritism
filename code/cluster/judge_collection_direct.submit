@@ -1,0 +1,108 @@
+#!/bin/bash
+#SBATCH --time=240
+#SBATCH --job-name=judge_collection
+#SBATCH --ntasks=1
+#SBATCH --nodes=1
+#SBATCH --gres=gpu:h100pcie:1
+#SBATCH --account=cai_nlp
+#SBATCH --partition=gpu_top_ia
+#SBATCH --output=/cluster/home/zimmenoe/judge_logs/%j_%N_judge_collection.out
+#SBATCH --error=/cluster/home/zimmenoe/judge_logs/%j_%N_judge_collection.err
+
+[ -z "$JUDGE_MODEL" ] && echo "Error: JUDGE_MODEL required" && exit 1
+[ -z "$EVALUATION_SET" ] && echo "Error: EVALUATION_SET required" && exit 1
+
+MODE=${MODE:-"pairwise"}
+TEMPERATURE=${TEMPERATURE:-"0.0"}
+TOP_P=${TOP_P:-""}
+TOP_K=${TOP_K:-""}
+SEED=${SEED:-""}
+
+module load python/3.10.14
+
+SHARED_VENV="/cluster/home/$USER/venvs/faviscore_env"
+if [ ! -d "$SHARED_VENV" ]; then
+    echo "Creating shared venv at $SHARED_VENV..."
+    mkdir -p /cluster/home/$USER/venvs
+    python3 -m venv $SHARED_VENV
+    source $SHARED_VENV/bin/activate
+    pip install --upgrade pip
+    pip install ollama datasets pandas numpy tqdm requests
+else
+    source $SHARED_VENV/bin/activate
+fi
+
+export PIP_CACHE_DIR="/cluster/home/$USER/.cache/pip"
+
+PORT_INDEX=$((SLURM_JOB_ID % 4))
+OLLAMA_PORT=$((9036 + PORT_INDEX))
+OLLAMA_HOST="http://localhost:$OLLAMA_PORT"
+
+echo "Using Port: $OLLAMA_PORT"
+
+echo "Setting up Ollama..."
+OLLAMA_DIR="/scratch/ollama_$SLURM_JOB_ID"
+mkdir -p "$OLLAMA_DIR"
+cd "$OLLAMA_DIR"
+
+if [ ! -f "bin/ollama" ]; then
+    echo "Downloading Ollama..."
+    wget -q https://github.com/ollama/ollama/releases/download/v0.5.4/ollama-linux-amd64.tgz
+    tar -xzf ollama-linux-amd64.tgz
+    rm ollama-linux-amd64.tgz
+fi
+
+OLLAMA_MODELS_CACHE="/cluster/home/$USER/ollama_models_cache"
+OLLAMA_MODELS_JOB="$OLLAMA_DIR/models"
+
+mkdir -p "$OLLAMA_MODELS_CACHE"
+mkdir -p "$OLLAMA_MODELS_JOB"
+
+if [ -d "$OLLAMA_MODELS_CACHE" ] && [ "$(ls -A $OLLAMA_MODELS_CACHE 2>/dev/null)" ]; then
+    cp -r "$OLLAMA_MODELS_CACHE"/* "$OLLAMA_MODELS_JOB/" 2>/dev/null || true
+    echo "Models copied from cache"
+else
+    echo "No cached models found, will download fresh"
+fi
+
+export OLLAMA_MODELS="$OLLAMA_MODELS_JOB"
+export OLLAMA_HOST="0.0.0.0:$OLLAMA_PORT"
+
+echo "Starting Ollama server on port $OLLAMA_PORT..."
+"$OLLAMA_DIR/bin/ollama" serve > "$OLLAMA_DIR/ollama_server.log" 2>&1 &
+OLLAMA_PID=$!
+
+for i in {1..30}; do
+    curl -s "http://localhost:$OLLAMA_PORT/api/tags" > /dev/null 2>&1 && break
+    [ $i -eq 30 ] && echo "Ollama failed to start" && cat "$OLLAMA_DIR/ollama_server.log" && kill $OLLAMA_PID && exit 1
+    sleep 1
+done
+
+echo "Loading model: $JUDGE_MODEL"
+"$OLLAMA_DIR/bin/ollama" pull "$JUDGE_MODEL"
+
+rsync -a --ignore-existing "$OLLAMA_MODELS_JOB"/ "$OLLAMA_MODELS_CACHE/" 2>/dev/null || true
+
+JUDGE_NORMALIZED=$(echo $JUDGE_MODEL | sed 's/:/_/g' | sed 's/-/_/g' | sed 's/\//_/g')
+EVAL_NORMALIZED=$(echo $EVALUATION_SET | sed 's/\.json$//')
+OUTPUT_FILE="${EVAL_NORMALIZED}_${JUDGE_NORMALIZED}_outputs.json"
+
+CMD="python3 -u /cluster/home/$USER/BA-HS25-zimmenoe/code/cluster/collect_judge_outputs.py \
+    --judge-model $JUDGE_MODEL \
+    --evaluation-set /cluster/home/$USER/BA-HS25-zimmenoe/data/judge_eval/$EVALUATION_SET \
+    --output /cluster/home/$USER/BA-HS25-zimmenoe/data/judge_outputs/$OUTPUT_FILE \
+    --ollama-host http://localhost:$OLLAMA_PORT \
+    --mode $MODE \
+    --temperature $TEMPERATURE \
+    --save-interval 5"
+
+[ -n "$TOP_P" ] && CMD="$CMD --top-p $TOP_P"
+[ -n "$TOP_K" ] && CMD="$CMD --top-k $TOP_K"
+[ -n "$SEED" ] && CMD="$CMD --seed $SEED"
+
+eval $CMD
+EXIT_CODE=$?
+
+kill $OLLAMA_PID 2>/dev/null || true
+rm -rf "$OLLAMA_DIR"
+exit $EXIT_CODE

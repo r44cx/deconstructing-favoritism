@@ -1,0 +1,32 @@
+# Virtual environment
+/venv/
+
+# Data directories (large files)
+
+# Keep projects but exclude large files
+/projects/*/poetry.lock
+/projects/*/tests/
+/projects/*/.git/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+.env
+code/api/.env

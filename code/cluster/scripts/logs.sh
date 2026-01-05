@@ -1,0 +1,1 @@
+/cluster/home/zimmenoe/judge_logs/68199_*_judge_collection.{out,err}
